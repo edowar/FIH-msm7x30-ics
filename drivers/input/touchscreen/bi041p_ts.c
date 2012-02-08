@@ -16,7 +16,6 @@
 #include "../../../arch/arm/mach-msm/smd_private.h"
 #include "../../../arch/arm/mach-msm/proc_comm.h"
 
-extern int innolux_ts_active;
 extern int bu21018mwv_active;
 extern int i2c_elan_touch_update;
 extern int bq275x0_battery_elan_update_mode;
@@ -24,7 +23,7 @@ extern int bq275x0_battery_elan_update_mode;
 // flag of HW type
 static int hw_ver = HW_UNKNOW;
 static int bi041p_debug = 0;
-static bool bIsPenUp = 0;
+static bool bIsFingerUp = 0;
 static int fw_delay = 100;
 static int update_mode = 0;
 static int noise_time = 150;
@@ -38,12 +37,13 @@ bool bMenuCapKeyPressed = 0;
 bool bHomeCapKeyPressed = 0;
 bool bSearchCapKeyPressed = 0;
 
+static int t_max_x, t_min_x, t_max_y, t_min_y;
+
 static struct i2c_client *fclient;
 static int int_disable = 0;
 
 // for FQC firmware version
 static int msm_cap_touch_fw_version;
-static int ts_hw_ver = 0;
 
 module_param_named(
     fw_version, msm_cap_touch_fw_version, int, S_IRUGO | S_IWUSR | S_IWGRP
@@ -51,6 +51,7 @@ module_param_named(
 
 static struct workqueue_struct *fwupdate_wq;
 static struct workqueue_struct *resume_wq;
+static struct workqueue_struct *bi041p_wq;
 
 struct bi041p_info {
     struct i2c_client *client;
@@ -119,241 +120,198 @@ static int bi041p_get_fw_version(void)
 	minor = FW_MINOR(buffer);
 	msm_cap_touch_fw_version = major * 100 + minor;
 	
-	printk(KERN_INFO "[Touch] Get ELAN firmware version %d.\n", msm_cap_touch_fw_version);
+	printk(KERN_INFO "[Touchscreen] Get ELAN firmware version %d.\n", msm_cap_touch_fw_version);
 
 	return 0;
 }
 
-static int bi041p_get_tp_version(void)
-{
-	char cmd[4] = {0x53, 0xF0, 0x00, 0x01};
-	char buffer[4];
-	int ret = -1;
+/* For now, I think I'll just remove this macro */
+//#define XCORD1(x) ((((int)((x)[1]) & 0xF0) << 4) + ((int)((x)[2])))
+//#define YCORD1(y) ((((int)((y)[1]) & 0x0F) << 8) + ((int)((y)[3])))
+//#define XCORD2(x) ((((int)((x)[4]) & 0xF0) << 4) + ((int)((x)[5])))
+//#define YCORD2(y) ((((int)((y)[4]) & 0x0F) << 8) + ((int)((y)[6])))
+
+static int bi041p_get_coordinate(u8 *buf, int * pos) {
+
+	int xCORD1, xCORD2, yCORD1, yCORD2; //x1, x2, y1, y2
+	int ret = 0;
 	
-	bi041p_i2c_send(cmd, ARRAY_SIZE(cmd));
-	msleep(20);
-	bi041p_i2c_recv(buffer, ARRAY_SIZE(buffer));
-	
-	if (buffer[0] != 0x52) {
-		return ret;
-	}
-	
-	if (buffer[3] == 0x11)
-	{
-		printk(KERN_INFO "[Touch] Touch is WINTEK 0x%2x 0x%2x 0x%2x 0x%2x.\n", buffer[0], buffer[1], buffer[2], buffer[3]);
-		ts_hw_ver = 1;
+	/* Get our coordinates*/
+	xCORD1 = ((int)(buf[1] & 0xF0) << 4) + ((int)buf[2]);
+	yCORD1 = ((int)(buf[1] & 0x0F) << 8) + ((int)buf[3]);
+	xCORD2 = ((int)(buf[4] & 0xF0) << 4) + ((int)buf[5]);
+	yCORD2 = ((int)(buf[4] & 0x0F) << 8) + ((int)buf[6]);
+
+	if ((xCORD1 != 0) && (yCORD1 != 0)) {
+		pos[1] = abs(t_max_y - yCORD1);
+		pos[0] = xCORD1;
+		if (bi041p_debug) {
+			printk(KERN_INFO "[Touchscreen] %s: x1 = %u, y1 = %u\n", __func__, pos[0], pos[1]);
+		}
 		ret = 1;
+	} else {
+		pos[0] = 0;
+		pos[1] = 0;
 	}
-	else
-	{
-		printk(KERN_INFO "[Touch] Touch is ELAN 0x%2x 0x%2x 0x%2x 0x%2x.\n", buffer[0], buffer[1], buffer[2], buffer[3]);
-		ts_hw_ver = 2;
+	if ((xCORD2 != 0) && (yCORD2 != 0)) {
+		pos[3] = abs(t_max_y - yCORD2);
+		pos[2] = xCORD2;
+		if (bi041p_debug) {
+			printk(KERN_INFO "[Touchscreen] %s: x2 = %u, y2 = %u\n", __func__, pos[2], pos[3]);
+		}
 		ret = 2;
+	} else {
+		pos[2] = 0;
+		pos[3] = 0;
 	}
-	
-	return ret;
+return ret;
 }
 
-#define XCORD1(x) ((((int)((x)[1]) & 0xF0) << 4) + ((int)((x)[2])))
-#define YCORD1(y) ((((int)((y)[1]) & 0x0F) << 8) + ((int)((y)[3])))
-#define XCORD2(x) ((((int)((x)[4]) & 0xF0) << 4) + ((int)((x)[5])))
-#define YCORD2(y) ((((int)((y)[4]) & 0x0F) << 8) + ((int)((y)[6])))
+static void bi041p_isr_workqueue(struct work_struct *work) {
 
-static void bi041p_isr_workqueue(struct work_struct *work)
-{
 	u8 buffer[9];
-	int cnt, virtual_button;
+	int pos[4] = {0};
+	int cntBuf, virtual_button;
 	int retry = 3;
-	
-	do
-	{
+	int getTouch = 0;
+		
+	do {
 		if (bi041p_i2c_recv(buffer, ARRAY_SIZE(buffer)) == 0)
 			break;
 		
-		printk(KERN_INFO "[Touch] %s: retry = %d\n", __func__, 4-retry);
+		printk(KERN_INFO "[Touchscreen] %s: retry = %d\n", __func__, 4-retry);
 	} while (retry--);
 		
 	
 	if (bi041p_debug)
-	    printk(KERN_INFO "[Touch] %s: buffer[0]=0x%.2x,buffer[1]=0x%.2x,buffer[2]=0x%.2x,buffer[3]=0x%.2x,buffer[4]=0x%.2x,buffer[5]=0x%.2x,buffer[6]=0x%.2x,buffer[7]=0x%.2x,buffer[8]=0x%.2x\n", __func__, buffer[0],buffer[1],buffer[2],buffer[3],buffer[4],buffer[5],buffer[6],buffer[7],buffer[8]);
+	    printk(KERN_INFO "[Touchscreen] %s: buffer[0]=0x%.2x,buffer[1]=0x%.2x,buffer[2]=0x%.2x,buffer[3]=0x%.2x,buffer[4]=0x%.2x,buffer[5]=0x%.2x,buffer[6]=0x%.2x,buffer[7]=0x%.2x,buffer[8]=0x%.2x\n", __func__, buffer[0],buffer[1],buffer[2],buffer[3],buffer[4],buffer[5],buffer[6],buffer[7],buffer[8]);
 	
-	if (buffer[0] == 0x5A)
-	{
-		cnt = (buffer[8] ^ 0x01) >> 1;
+	if (buffer[0] == 0x5A) {
+		cntBuf = (buffer[8] ^ 0x01) >> 1;
 		virtual_button = (buffer[8]) >> 3;
+		getTouch = bi041p_get_coordinate(buffer, pos);
 		
-		if ((virtual_button == 0) && !bBackCapKeyPressed && !bMenuCapKeyPressed && !bHomeCapKeyPressed && !bSearchCapKeyPressed)
-		{
-#ifdef CONFIG_FIH_FTM
-			if (cnt) {
-                input_report_abs(bi041p.input, ABS_X, XCORD1(buffer));
-                input_report_abs(bi041p.input, ABS_Y, abs(1088 - YCORD1(buffer)));
-                input_report_abs(bi041p.input, ABS_PRESSURE, 255);
-                input_report_key(bi041p.input, BTN_TOUCH, 1);
-            } else {
-                input_report_abs(bi041p.input, ABS_PRESSURE, 0);
-                input_report_key(bi041p.input, BTN_TOUCH, 0);
-            }
-#else
-			if (cnt) {
-				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 255);
-				input_report_abs(bi041p.input, ABS_MT_POSITION_X, XCORD1(buffer));
-				input_report_abs(bi041p.input, ABS_MT_POSITION_Y, abs(1088 - YCORD1(buffer)));
-				input_mt_sync(bi041p.input);
-			} else {
+		if ((virtual_button == 0) && !bBackCapKeyPressed && !bMenuCapKeyPressed && !bHomeCapKeyPressed && !bSearchCapKeyPressed) {
+			if (!cntBuf) {
 				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
-				input_report_abs(bi041p.input, ABS_MT_POSITION_X, XCORD1(buffer));
-				input_report_abs(bi041p.input, ABS_MT_POSITION_Y, abs(1088 - YCORD1(buffer)));
+				input_report_abs(bi041p.input, ABS_MT_PRESSURE, 0);
+				input_report_key(bi041p.input, BTN_TOUCH, 0);
 				input_mt_sync(bi041p.input);
-			}
-			if (cnt > 1) {
-				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 255);
-				input_report_abs(bi041p.input, ABS_MT_POSITION_X, XCORD2(buffer));
-				input_report_abs(bi041p.input, ABS_MT_POSITION_Y, abs(1088 - YCORD2(buffer)));
-				input_mt_sync(bi041p.input);
+				bIsFingerUp = 1;
 			} else {
-				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
-				input_report_abs(bi041p.input, ABS_MT_POSITION_X, XCORD2(buffer));
-				input_report_abs(bi041p.input, ABS_MT_POSITION_Y, abs(1088 - YCORD2(buffer)));
-				input_mt_sync(bi041p.input);
+				if (cntBuf && getTouch) {
+					/* Panel recoginizes single touch */
+					if (pos[0] != 0 && pos[1] != 0) {
+						input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 255);
+						input_report_abs(bi041p.input, ABS_MT_POSITION_X, pos[0]);
+						input_report_abs(bi041p.input, ABS_MT_POSITION_Y, pos[1]);
+						input_report_abs(bi041p.input, ABS_MT_PRESSURE, 255);
+						input_report_key(bi041p.input, BTN_TOUCH, 1);
+						input_mt_sync(bi041p.input);
+					}
+				}
+				if ((cntBuf > 1) && getTouch) {
+					/* Panel recognizes that we have 2nd finger touch */
+					input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 255);
+					input_report_abs(bi041p.input, ABS_MT_POSITION_X, pos[2]);
+					input_report_abs(bi041p.input, ABS_MT_POSITION_Y, pos[3]);
+					input_report_abs(bi041p.input, ABS_MT_PRESSURE, 255);
+					input_report_key(bi041p.input, BTN_TOUCH, 1);
+					input_mt_sync(bi041p.input);
+				} else {
+					/* No longer have 2nd finger touch */
+					input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
+					input_report_abs(bi041p.input, ABS_MT_POSITION_X, pos[2]);
+					input_report_abs(bi041p.input, ABS_MT_POSITION_Y, pos[3]);
+					input_mt_sync(bi041p.input);
+				}
+				bIsFingerUp = 0;
 			}
-#endif
-            if (!cnt)
-            {
-				if (bi041p_debug)
-					printk(KERN_INFO "[Touch] %s: Pen Up.\n", __func__);
-					
-                bIsPenUp = 1;
-			}
-            else
-            {
-				if (bi041p_debug)
-					printk(KERN_INFO "[Touch] %s: Pen Down.\n", __func__);
-					
-                bIsPenUp = 0;
-			}
-		}
-		else if ((virtual_button == 0) && (bBackCapKeyPressed || bMenuCapKeyPressed || bHomeCapKeyPressed || bSearchCapKeyPressed))
-		{
-			if (bBackCapKeyPressed)
-			{
+		} else if ((virtual_button == 0) && (bBackCapKeyPressed || bMenuCapKeyPressed || bHomeCapKeyPressed || bSearchCapKeyPressed)) {
+			if (bBackCapKeyPressed) {
 				input_report_key(bi041p.input, KEY_BACK, 0);
 				bBackCapKeyPressed = 0;
 				bMenuCapKeyPressed = 0;
 				bHomeCapKeyPressed = 0;
 				bSearchCapKeyPressed = 0;
-			}
-			else if (bMenuCapKeyPressed)
-			{
+			} else if (bMenuCapKeyPressed) {
 				input_report_key(bi041p.input, KEY_MENU, 0);
 				bBackCapKeyPressed = 0;
 				bMenuCapKeyPressed = 0;
 				bHomeCapKeyPressed = 0;
 				bSearchCapKeyPressed = 0;
-			}
-			else if (bHomeCapKeyPressed)
-			{
+			} else if (bHomeCapKeyPressed) {
 				input_report_key(bi041p.input, KEY_HOME, 0);
 				bBackCapKeyPressed = 0;
 				bMenuCapKeyPressed = 0;
 				bHomeCapKeyPressed = 0;
 				bSearchCapKeyPressed = 0;
-			}
-			else if (bSearchCapKeyPressed)
-			{
+			} else if (bSearchCapKeyPressed) {
 				input_report_key(bi041p.input, KEY_SEARCH, 0);
 				bBackCapKeyPressed = 0;
 				bMenuCapKeyPressed = 0;
 				bHomeCapKeyPressed = 0;
 				bSearchCapKeyPressed = 0;
 			}
-		}
-		else if (virtual_button == 2 && !bBackCapKeyPressed)
-		{
-            if (!bIsPenUp)
-            {
+		} else if (virtual_button == 2 && !bBackCapKeyPressed) {
+			if (!bIsFingerUp) {
 				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
 				input_mt_sync(bi041p.input);
-                bIsPenUp = 1;
-            }
+				bIsFingerUp = 1;
+			}
             
-			if (hw_ver == HW_FD1_PR3 || hw_ver == HW_FD1_PR4)
-			{
+			if (hw_ver == HW_FD1_PR3 || hw_ver == HW_FD1_PR4) {
+				input_report_key(bi041p.input, KEY_MENU, 1);
+				bMenuCapKeyPressed = 1;
+			} else {
+				input_report_key(bi041p.input, KEY_BACK, 1);
+				bBackCapKeyPressed = 1;
+			}
+		} else if (virtual_button == 4 && !bMenuCapKeyPressed) {
+			if (!bIsFingerUp) {
+				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
+				input_mt_sync(bi041p.input);
+				bIsFingerUp = 1;
+			}
+            
+			if (hw_ver == HW_FD1_PR3 || hw_ver == HW_FD1_PR4) {
+				input_report_key(bi041p.input, KEY_HOME, 1);
+				bHomeCapKeyPressed = 1;
+			} else {
 				input_report_key(bi041p.input, KEY_MENU, 1);
 				bMenuCapKeyPressed = 1;
 			}
-			else
-			{
-				input_report_key(bi041p.input, KEY_BACK, 1);
-				bBackCapKeyPressed = 1;
-			}
-		}
-		else if (virtual_button == 4 && !bMenuCapKeyPressed)
-		{
-            if (!bIsPenUp)
-            {
+		} else if (virtual_button == 8 && !bHomeCapKeyPressed) {
+			if (!bIsFingerUp) {
 				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
 				input_mt_sync(bi041p.input);
-                bIsPenUp = 1;
-            }
+				bIsFingerUp = 1;
+			}
             
-			if (hw_ver == HW_FD1_PR3 || hw_ver == HW_FD1_PR4)
-			{
+			if (hw_ver == HW_FD1_PR3) {
+				input_report_key(bi041p.input, KEY_SEARCH, 1);
+				bSearchCapKeyPressed = 1;
+			} else if (hw_ver == HW_FD1_PR4) {
+				input_report_key(bi041p.input, KEY_BACK, 1);
+				bBackCapKeyPressed = 1;
+			} else {
 				input_report_key(bi041p.input, KEY_HOME, 1);
 				bHomeCapKeyPressed = 1;
 			}
-			else
-			{
-				input_report_key(bi041p.input, KEY_MENU, 1);
-				bMenuCapKeyPressed = 1;
-			}
-		}
-		else if (virtual_button == 8 && !bHomeCapKeyPressed)
-		{
-            if (!bIsPenUp)
-            {
+		} else if (virtual_button == 16 && !bSearchCapKeyPressed) {
+			if (!bIsFingerUp) {
 				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
 				input_mt_sync(bi041p.input);
-                bIsPenUp = 1;
-            }
-            
-			if (hw_ver == HW_FD1_PR3)
-			{
-				input_report_key(bi041p.input, KEY_SEARCH, 1);
-				bSearchCapKeyPressed = 1;
+				bIsFingerUp = 1;
 			}
-			else if (hw_ver == HW_FD1_PR4)
-			{
+            
+			if (hw_ver == HW_FD1_PR3) {
 				input_report_key(bi041p.input, KEY_BACK, 1);
 				bBackCapKeyPressed = 1;
-			}
-			else
-			{
-				input_report_key(bi041p.input, KEY_HOME, 1);
-				bHomeCapKeyPressed = 1;
-			}
-		}
-		else if (virtual_button == 16 && !bSearchCapKeyPressed)
-		{
-            if (!bIsPenUp)
-            {
-				input_report_abs(bi041p.input, ABS_MT_TOUCH_MAJOR, 0);
-				input_mt_sync(bi041p.input);
-                bIsPenUp = 1;
-            }
-            
-			if (hw_ver == HW_FD1_PR3)
-			{
-				input_report_key(bi041p.input, KEY_BACK, 1);
-				bBackCapKeyPressed = 1;
-			}
-			else if (hw_ver == HW_FD1_PR4)
-			{
+			} else if (hw_ver == HW_FD1_PR4) {
 				input_report_key(bi041p.input, KEY_SEARCH, 1);
 				bSearchCapKeyPressed = 1;
-			}
-			else
-			{
+			} else {
 				input_report_key(bi041p.input, KEY_SEARCH, 1);
 				bSearchCapKeyPressed = 1;
 			}
@@ -361,21 +319,14 @@ static void bi041p_isr_workqueue(struct work_struct *work)
 		
 		input_sync(bi041p.input);
 	}
-	else if ((buffer[0] == 0x55) && (buffer[1] == 0x55) && (buffer[2] == 0x55) && (buffer[3] == 0x55))
-	{
-		printk(KERN_INFO "[Touch] %s: Receive the hello packet!\n", __func__);
+	else if ((buffer[0] == 0x55) && (buffer[1] == 0x55) && (buffer[2] == 0x55) && (buffer[3] == 0x55)) {
+		printk(KERN_INFO "[Touchscreen] %s: Receive the hello packet!\n", __func__);
 	}
-	
-	enable_irq(bi041p.client->irq);
 }
 
 static irqreturn_t bi041p_isr(int irq, void * handle)
 {
-    struct bi041p_info *ts = handle;
-	
-	disable_irq_nosync(bi041p.client->irq);
-	schedule_work(&ts->wqueue);
-	
+        queue_work(bi041p_wq, &bi041p.wqueue);
     return IRQ_HANDLED;
 }
 
@@ -418,7 +369,7 @@ static int bi041p_reset(void)
 	
 	if (gpio_tlmm_config(GPIO_CFG(56, 0, GPIO_CFG_OUTPUT, GPIO_CFG_PULL_DOWN, GPIO_CFG_2MA), GPIO_CFG_ENABLE))
 	{
-		printk(KERN_ERR "[Touch] %s: gpio_tlmm_config: 56 failed.\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: gpio_tlmm_config: 56 failed.\n", __func__);
 		return 0;
 	}
 	else
@@ -440,7 +391,7 @@ static int bi041p_reset(void)
 		
 		if (--retry == 0)
 		{
-			printk(KERN_ERR "[Touch] %s: receive hello package timeout.\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: receive hello package timeout.\n", __func__);
 			return 0;
 		}
 	}while (pkt);
@@ -469,12 +420,8 @@ static void resume_work_func(struct work_struct *work)
 }
 
 #ifdef CONFIG_FIH_FTM
-//#define FW_FILE_1 "/ftm/emc_ISP_cds.cds"
-#define FW_FILE_FTM_1 "/ftm/elan_fw_wintek.cds"
-#define FW_FILE_FTM_2 "/ftm/elan_fw_elan.cds"
-//#define FW_FILE_2 "/sdcard/emc_ISP_cds.cds"
-#define FW_FILE_SD_1 "/sdcard/elan_fw_wintek.cds"
-#define FW_FILE_SD_2 "/sdcard/elan_fw_elan.cds"
+#define FW_FILE_1 "/ftm/emc_ISP_cds.cds"
+#define FW_FILE_2 "/sdcard/emc_ISP_cds.cds"
 #else
 #define FW_FILE "/data/misc/emc_ISP_cds.cds"
 #endif
@@ -497,27 +444,13 @@ static int fw_update(void)
 	
 #ifdef CONFIG_FIH_FTM
 	if (file_path == 1)
-	{
-		if (bi041p_get_tp_version() == 1)
-			filp = filp_open(FW_FILE_FTM_1, O_RDONLY, 0);
-		else if (bi041p_get_tp_version() == 2)
-			filp = filp_open(FW_FILE_FTM_2, O_RDONLY, 0);
-		else
-			return -1;
-	}
+		filp = filp_open(FW_FILE_1, O_RDONLY, 0);
 	else if (file_path == 2)
-	{
-		if (bi041p_get_tp_version() == 1)
-			filp = filp_open(FW_FILE_SD_1, O_RDONLY, 0);
-		else if (bi041p_get_tp_version() == 2)
-			filp = filp_open(FW_FILE_SD_2, O_RDONLY, 0);
-		else
-			return -1;
-	}
+		filp = filp_open(FW_FILE_2, O_RDONLY, 0);
 	else
 	{
-		printk(KERN_ERR "[Touch] %s: Invalid file path!", __func__);
-		ftm_fw_update_result = -1;
+		printk(KERN_ERR "[Touchscreen] %s: Invalid file path!", __func__);
+		ftm_fw_update_result = 2;
 		return -1;
 	}
 #else
@@ -526,15 +459,15 @@ static int fw_update(void)
 	
     if (IS_ERR(filp))
     {
-        printk(KERN_ERR "[Touch] %s: Open file failed!\n", __func__);
+        printk(KERN_ERR "[Touchscreen] %s: Open file failed!\n", __func__);
         filp = NULL;
 #ifdef CONFIG_FIH_FTM
-		ftm_fw_update_result = -1;
+		ftm_fw_update_result = 2;
 #endif
         return -1;
     }
     else
-		printk(KERN_INFO "[Touch] %s: Start ELAN touch update.\n", __func__);
+		printk(KERN_INFO "[Touchscreen] %s: Start ELAN touch update.\n", __func__);
 		
     // Start update
 	wake_lock(&bi041p.wake_lock);
@@ -544,7 +477,7 @@ static int fw_update(void)
 	
     if (i2c_master_send(fclient, cmd_writepassword, 3) != 3)
     {
-		printk(KERN_ERR "[Touch] %s: Write password failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Write password failed!\n", __func__);
 		wfail = 1;
 		goto fu_err;
 	}
@@ -553,7 +486,7 @@ static int fw_update(void)
     
     if (i2c_master_send(fclient, cmd_erasecodeoption, 1) != 1)
     {
-		printk(KERN_ERR "[Touch] %s: Erase code option failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Erase code option failed!\n", __func__);
 		wfail = 1;
 		goto fu_err;
 	}
@@ -562,7 +495,7 @@ static int fw_update(void)
     
     if (i2c_master_send(fclient, cmd_masserase, 1) != 1)
     {
-		printk(KERN_ERR "[Touch] %s: Mass erase failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Mass erase failed!\n", __func__);
 		wfail = 1;
 		goto fu_err;
 	}
@@ -571,7 +504,7 @@ static int fw_update(void)
     
     if (i2c_master_send(fclient, cmd_writecodeoption, 5) != 5)
     {
-		printk(KERN_ERR "[Touch] %s: Write code option failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Write code option failed!\n", __func__);
 		wfail = 1;
 		goto fu_err;
 	}
@@ -583,10 +516,7 @@ static int fw_update(void)
 		buf[0] = 0x02;
 		buf[1] = (unsigned char)i;
 		
-		printk(KERN_INFO "[Touch] %s: Page %d.\n", __func__, i);
-#ifdef CONFIG_FIH_FTM
-		ftm_fw_update_result = i;
-#endif
+		printk(KERN_INFO "[Touchscreen] %s: Page %d.\n", __func__, i);
 		
 		nRead = filp->f_op->read(filp, (unsigned char __user *)&buf[2], 128, &filp->f_pos);
 		
@@ -598,7 +528,7 @@ static int fw_update(void)
 		// write page
 		if (i2c_master_send(fclient, buf, 128+2) != 130)
 		{
-			printk(KERN_ERR "[Touch] %s: Write page failed!\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: Write page failed!\n", __func__);
 			wfail = 1;
 			break;
 		}
@@ -620,7 +550,7 @@ static int fw_update(void)
 		
 		if (i2c_master_recv(fclient, buf1, 128) != 128)
 		{
-			printk(KERN_ERR "[Touch] %s: Read page failed!\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: Read page failed!\n", __func__);
 			wfail = 1;
 			break;
 		}
@@ -628,7 +558,7 @@ static int fw_update(void)
 		// verify
 		if (memcmp(&buf[2], buf1, 128) != 0)
 		{
-			printk(KERN_ERR "[Touch] %s: Compare failed!\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: Compare failed!\n", __func__);
 			wfail = 1;
 			break;
 		}
@@ -639,7 +569,7 @@ static int fw_update(void)
 	
     if (i2c_master_send(fclient, cmd_resetmcu, 1) != 1)
     {
-		printk(KERN_ERR "[Touch] %s: Reset MCU failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Reset MCU failed!\n", __func__);
 		wfail = 1;
 	}
 	
@@ -674,9 +604,9 @@ static void fwupdate_work_func(struct work_struct *work)
 		
 		if (ret == 1)
 		{
-			printk(KERN_INFO "[Touch] %s: Firmware update success.\n", __func__);
+			printk(KERN_INFO "[Touchscreen] %s: Firmware update success.\n", __func__);
 #ifdef CONFIG_FIH_FTM
-//			ftm_fw_update_result = 1;
+			ftm_fw_update_result = 1;
 #else
 			proc_comm_ftm_hw_reset();
 #endif
@@ -684,16 +614,16 @@ static void fwupdate_work_func(struct work_struct *work)
 		}
 		else if (ret < 0)
 		{
-			printk(KERN_ERR "[Touch] %s: Not I2C unstable issue. STOP retry!\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: Not I2C unstable issue. STOP retry!\n", __func__);
 			return;
 		}
 		else
 		{
-			printk(KERN_INFO "[Touch] %s: Retry = %d. ELAN reset...\n", __func__, i+1);
+			printk(KERN_INFO "[Touchscreen] %s: Retry = %d. ELAN reset...\n", __func__, i+1);
 			
 			if (gpio_tlmm_config(GPIO_CFG(56, 0, GPIO_CFG_OUTPUT, GPIO_CFG_PULL_DOWN, GPIO_CFG_2MA), GPIO_CFG_ENABLE))
 			{
-				printk(KERN_ERR "[Touch] %s: gpio_tlmm_config: 56 failed.\n", __func__);
+				printk(KERN_ERR "[Touchscreen] %s: gpio_tlmm_config: 56 failed.\n", __func__);
 				return;
 			}
 			else
@@ -739,12 +669,12 @@ static int bi041p_noise_monitor(void)
 	for (i=0;i<noise_time;i++)
 	{
 		if (bi041p_i2c_send(cmd3, ARRAY_SIZE(cmd3)) < 0)
-			printk(KERN_ERR "[Touch] %s: bi041p_i2c_send() failed!", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: bi041p_i2c_send() failed!", __func__);
 		
 		msleep(1);
 		
 		if (bi041p_i2c_recv(buffer, ARRAY_SIZE(buffer)) < 0)
-			printk(KERN_ERR "[Touch] %s: bi041p_i2c_recv() failed!", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: bi041p_i2c_recv() failed!", __func__);
 		
 		for (j=0;j<MAX_X_AXIS;j++)
 		{
@@ -782,11 +712,11 @@ static int bi041p_misc_ioctl(struct inode *inode, struct file *file, unsigned in
 	switch (cmd)
 	{
 		case 65000:
-		    printk(KERN_INFO "[Touch] Debug message ON.\n");
+		    printk(KERN_INFO "[Touchscreen] Debug message ON.\n");
 			bi041p_debug = 1;
 			break;
 		case 65001:
-		    printk(KERN_INFO "[Touch] Debug message OFF.\n");
+		    printk(KERN_INFO "[Touchscreen] Debug message OFF.\n");
 			bi041p_debug = 0;
 			break;
 		case 65002:
@@ -802,7 +732,7 @@ static int bi041p_misc_ioctl(struct inode *inode, struct file *file, unsigned in
             
             fw_delay = value;
             
-            printk(KERN_INFO "[Touch] Set firmware update delay value = %d\n", fw_delay);
+            printk(KERN_INFO "[Touchscreen] Set firmware update delay value = %d\n", fw_delay);
             break;
 #ifdef CONFIG_FIH_FTM
 		case 65005:
@@ -818,19 +748,16 @@ static int bi041p_misc_ioctl(struct inode *inode, struct file *file, unsigned in
 			break;
 #endif
 		case 65008:
-			return bi041p_get_tp_version();
-			break;
-		case 65009:
-            if (copy_from_user(&value, argp, sizeof(value)))
-                value = (unsigned int)arg;
+			if (copy_from_user(&value, argp, sizeof(value)))
+				value = (unsigned int)arg;
 			
 			noise_time = value;
-			printk(KERN_INFO "[Touch] %s: noise test times = %d\n", __func__, noise_time);
+			printk(KERN_INFO "[Touchscreen] %s: noise test times = %d\n", __func__, noise_time);
 			
 			return bi041p_noise_monitor();
 			break;
 		default:
-			printk(KERN_ERR "[Touch] %s: unknow IOCTL.\n", __func__);
+			printk(KERN_ERR "[Touchscreen] %s: unknow IOCTL.\n", __func__);
 			break;
 	}
 	
@@ -853,9 +780,9 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 	struct i2c_adapter *fw_adap = i2c_get_adapter(0);
 	
 	// check ROHM exist
-	if (bu21018mwv_active || innolux_ts_active)
+	if (bu21018mwv_active)
 	{
-		printk(KERN_INFO "[Touch] %s: BU21018MWV already exists. bi041p_probe() abort.\n", __func__);
+		printk(KERN_INFO "[Touchscreen] %s: BU21018MWV already exists. bi041p_probe() abort.\n", __func__);
 		return -ENODEV;
 	}
 		
@@ -864,29 +791,29 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 		(fih_get_product_id() == Product_FD1 && fih_get_product_phase() == Product_PR231))
 	{
 		hw_ver = HW_FD1_PR3;
-		printk(KERN_INFO "[Touch] Virtual key mapping for FD1 PR235.\n");
+		printk(KERN_INFO "[Touchscreen] Virtual key mapping for FD1 PR235.\n");
 	}
 	else if ((fih_get_product_id() == Product_FD1 && fih_get_product_phase() == Product_PR4) ||
 			(fih_get_product_id() == Product_FD1 && fih_get_product_phase() == Product_PR5))
 	{
 	    hw_ver = HW_FD1_PR4;
-	    printk(KERN_INFO "[Touch] Virtual key mapping for FD1 PR4 and PR5.\n");
+	    printk(KERN_INFO "[Touchscreen] Virtual key mapping for FD1 PR4 and PR5.\n");
 	}
 	else if (fih_get_product_id() == Product_FD1)
 	{
 	    hw_ver = HW_FD1_PR4;
-	    printk(KERN_INFO "[Touch] Virtual key mapping for FD1.\n");
+	    printk(KERN_INFO "[Touchscreen] Virtual key mapping for FD1.\n");
 	}
 	else
 	{
 		hw_ver = HW_FB0;
-		printk(KERN_INFO "[Touch] Virtual key mapping for FB0.\n");
+		printk(KERN_INFO "[Touchscreen] Virtual key mapping for FB0.\n");
 	}
 	
 	// check I2C
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 	{
-		printk(KERN_ERR "[Touch] %s: Check I2C functionality failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Check I2C functionality failed!\n", __func__);
 		return -ENODEV;
 	}
 	
@@ -898,14 +825,14 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 	// set power
 	if (!bi041p_set_power_domain())
 	{
-		printk(KERN_ERR "[Touch] %s: Set power fail!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Set power fail!\n", __func__);
     	return -EIO;
 	}
     
     // chip reset
     if (!bi041p_reset())
     {
-    	printk(KERN_ERR "[Touch] %s: Chip reset fail!\n", __func__);
+    	printk(KERN_ERR "[Touchscreen] %s: Chip reset fail!\n", __func__);
 		goto err_chk;
     }
     
@@ -914,7 +841,7 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 	
     if (bi041p.input == NULL)
 	{
-		printk(KERN_ERR "[Touch] %s: Can not allocate memory for touch input device!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Can not allocate memory for touch input device!\n", __func__);
 		goto err1;
 	}
 	
@@ -924,35 +851,42 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 	set_bit(EV_ABS, bi041p.input->evbit);
 	set_bit(EV_SYN, bi041p.input->evbit);
 	set_bit(BTN_TOUCH, bi041p.input->keybit);
-    set_bit(KEY_BACK, bi041p.input->keybit);
+	set_bit(KEY_BACK, bi041p.input->keybit);
 	set_bit(KEY_MENU, bi041p.input->keybit);
-    set_bit(KEY_HOME, bi041p.input->keybit);
-    set_bit(KEY_SEARCH, bi041p.input->keybit);
+	set_bit(KEY_HOME, bi041p.input->keybit);
+	set_bit(KEY_SEARCH, bi041p.input->keybit);
+	
+	t_max_x = TS_MAX_X;
+	t_min_x = TS_MIN_X;
+	t_max_y = TS_MAX_Y;
+	t_min_y = TS_MIN_Y;
 
 #ifdef CONFIG_FIH_FTM
 	input_set_abs_params(bi041p.input, ABS_X, TS_MIN_X, TS_MAX_X, 0, 0);
 	input_set_abs_params(bi041p.input, ABS_Y, TS_MIN_Y, TS_MAX_Y, 0, 0);
 	input_set_abs_params(bi041p.input, ABS_PRESSURE, 0, 255, 0, 0);
 #else
-    input_set_abs_params(bi041p.input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
-    input_set_abs_params(bi041p.input, ABS_MT_POSITION_X, TS_MIN_X, TS_MAX_X, 0, 0);
-    input_set_abs_params(bi041p.input, ABS_MT_POSITION_Y, TS_MIN_Y, TS_MAX_Y, 0, 0);
+	input_set_abs_params(bi041p.input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+	input_set_abs_params(bi041p.input, ABS_MT_POSITION_X, TS_MIN_X, TS_MAX_X, 0, 0);
+	input_set_abs_params(bi041p.input, ABS_MT_POSITION_Y, TS_MIN_Y, TS_MAX_Y, 0, 0);
+	input_set_abs_params(bi041p.input, ABS_PRESSURE, 0, 255, 0, 0);
 #endif
 	
 	if (input_register_device(bi041p.input))
 	{
-		printk(KERN_ERR "[Touch] %s: Can not register touch input device.\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Can not register touch input device.\n", __func__);
 		goto err2;
 	}
     
 	// initial IRQ
     gpio_tlmm_config(GPIO_CFG(42, 0, GPIO_CFG_INPUT, GPIO_CFG_NO_PULL, GPIO_CFG_2MA), GPIO_CFG_ENABLE);
     
+        bi041p_wq = create_singlethread_workqueue("bi041p_wq");
 	INIT_WORK(&bi041p.wqueue, bi041p_isr_workqueue);
     
     if (request_irq(bi041p.client->irq, bi041p_isr, IRQF_TRIGGER_FALLING, "bi041p", &bi041p))
     {
-        printk(KERN_ERR "[Touch] %s: Request IRQ failed.\n", __func__);
+        printk(KERN_ERR "[Touchscreen] %s: Request IRQ failed.\n", __func__);
         goto err3;
     }
     
@@ -965,14 +899,13 @@ static int bi041p_probe(struct i2c_client *client, const struct i2c_device_id *i
 
 	// get firmware version
 	bi041p_get_fw_version();
-	bi041p_get_tp_version();
 
 	// workqueue for resume
 	resume_wq = create_singlethread_workqueue("resume_wq");
 	
 	if (!resume_wq)
 	{
-		printk(KERN_ERR "[Touch] %s: Can not create resume_wq!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Can not create resume_wq!\n", __func__);
 		goto err4;
 	}
 	
@@ -986,7 +919,7 @@ err_chk:
 	
 	if (!fclient)
 	{
-		printk(KERN_ERR "[Touch] %s: Check I2C address 0x77 failed!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Check I2C address 0x77 failed!\n", __func__);
 		goto err5;
 	}
 	
@@ -995,7 +928,7 @@ err_chk:
 	
 	if (!fwupdate_wq)
 	{
-		printk(KERN_ERR "[Touch] %s: Can not create fwupdate_wq!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Can not create fwupdate_wq!\n", __func__);
 		goto err6;
 	}
 	
@@ -1006,7 +939,7 @@ err_chk:
 	// register misc device
 	if (misc_register(&bi041p_misc_dev))
 	{
-		printk(KERN_ERR "[Touch] %s: Can not register misc device!\n", __func__);
+		printk(KERN_ERR "[Touchscreen] %s: Can not register misc device!\n", __func__);
 		goto err7;
 	}
 	
@@ -1027,36 +960,15 @@ err2:
 err1:
 	dev_set_drvdata(&client->dev, NULL);
 	
-    printk(KERN_ERR "[Touch] %s: Failed.\n", __func__);
+    printk(KERN_ERR "[Touchscreen] %s: Failed.\n", __func__);
     return -1;
-}
-
-static int ts_read_proc(char *page, char **start, off_t off,
-						int count, int *eof, void *data)
-{
-	char ver[24];
-	int len;
-		
-	if (ts_hw_ver == 1)
-		strcpy(ver, "WINTEK");
-	else if (ts_hw_ver == 2)
-		strcpy(ver, "ACROSENSE");
-	
-	len = snprintf(page, PAGE_SIZE, "%s\n", ver);
-	
-	if (len <= off+count) *eof = 1;
-	*start = page + off;
-	len -= off;
-	if (len>count) len = count;
-	if (len<0) len = 0;
-	
-	return len;
 }
 
 static int bi041p_remove(struct i2c_client * client)
 {
-	printk(KERN_INFO "[Touch] %s\n", __func__);
+	printk(KERN_INFO "[Touchscreen] %s\n", __func__);
 
+        destroy_workqueue(bi041p_wq);
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	unregister_early_suspend(&bi041p.es);
 #endif
@@ -1083,7 +995,7 @@ static void bi041p_early_suspend(struct early_suspend *h)
 {
 	char cmd[4] = {0x54, 0x50, 0x00, 0x01};
 
-    printk(KERN_INFO "[Touch] %s\n", __func__);
+    printk(KERN_INFO "[Touchscreen] %s\n", __func__);
     
 	if (!update_mode)
 	{
@@ -1093,7 +1005,7 @@ static void bi041p_early_suspend(struct early_suspend *h)
 		mutex_unlock(&bi041p.mutex);
 	}
 	else
-		printk(KERN_INFO "[Touch] %s: firmware update mode. do nothing.\n", __func__);
+		printk(KERN_INFO "[Touchscreen] %s: firmware update mode. do nothing.\n", __func__);
 }
 
 static void bi041p_late_resume(struct early_suspend *h)
@@ -1105,7 +1017,7 @@ static void bi041p_late_resume(struct early_suspend *h)
 		mutex_unlock(&bi041p.mutex);
 	}
 	else
-		printk(KERN_INFO "[Touch] %s: firmware update mode. do nothing.\n", __func__);
+		printk(KERN_INFO "[Touchscreen] %s: firmware update mode. do nothing.\n", __func__);
 }
 #endif
 
@@ -1127,7 +1039,6 @@ static struct i2c_driver bi041p_driver = {
 
 static int __init bi041p_init(void)
 {
-	create_proc_read_entry ("ts_hw_type", 0, NULL, ts_read_proc, NULL);
 	return i2c_add_driver(&bi041p_driver);
 }
 

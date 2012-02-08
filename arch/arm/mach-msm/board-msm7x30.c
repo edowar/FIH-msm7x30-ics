@@ -9588,12 +9588,12 @@ static void __init fb_size_setup(char **p)
 }
 __early_param("fb_size=", fb_size_setup);
 
-static unsigned gpu_phys_size = MSM_GPU_PHYS_SIZE;
-static void __init gpu_phys_size_setup(char **p)
-{
-	gpu_phys_size = memparse(*p, p);
-}
-__early_param("gpu_phys_size=", gpu_phys_size_setup);
+//static unsigned gpu_phys_size = MSM_GPU_PHYS_SIZE;
+//static void __init gpu_phys_size_setup(char **p)
+//{
+//	gpu_phys_size = memparse(*p, p);
+//}
+//__early_param("gpu_phys_size=", gpu_phys_size_setup);
 
 static unsigned pmem_adsp_size = MSM_PMEM_ADSP_SIZE;
 static void __init pmem_adsp_size_setup(char **p)
@@ -9735,7 +9735,7 @@ MACHINE_START(MSM8X55_SURF, "QCT MSM8X55 SURF")
 	.timer = &msm_timer,
 MACHINE_END
 
-MACHINE_START(MSM8X55_FFA, "fb0")
+MACHINE_START(MSM8X55_FFA, "triumph")
 #ifdef CONFIG_MSM_DEBUG_UART
 	.phys_io  = MSM_DEBUG_UART_PHYS,
 	.io_pg_offst = ((MSM_DEBUG_UART_BASE) >> 18) & 0xfffc,

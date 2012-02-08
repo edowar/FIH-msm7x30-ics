@@ -120,6 +120,8 @@ static void innolux_ts_isr_workqueue(struct work_struct *work)
 		input_report_abs(ts->touch_input, ABS_MT_TOUCH_MAJOR, 255);
 		input_report_abs(ts->touch_input, ABS_MT_POSITION_X, x1);
 		input_report_abs(ts->touch_input, ABS_MT_POSITION_Y, y1);
+		input_report_abs(ts->touch_input, ABS_PRESSURE, 255);
+		input_report_key(ts->touch_input, BTN_TOUCH, 1);
 		input_mt_sync(ts->touch_input);
 //		input_sync(ts->touch_input);
 
@@ -131,6 +133,8 @@ static void innolux_ts_isr_workqueue(struct work_struct *work)
             input_report_abs(ts->touch_input, ABS_MT_TOUCH_MAJOR, 255);
             input_report_abs(ts->touch_input, ABS_MT_POSITION_X, x2);
             input_report_abs(ts->touch_input, ABS_MT_POSITION_Y, y2);
+            input_report_abs(ts->touch_input, ABS_PRESSURE, 255);
+            input_report_key(ts->touch_input, BTN_TOUCH, 1);
             input_mt_sync(ts->touch_input);
         }
 #endif
@@ -166,6 +170,8 @@ static void innolux_ts_isr_workqueue(struct work_struct *work)
 			input_report_key(ts->touch_input, BTN_TOUCH, 0);
 #else
 			input_report_abs(ts->touch_input, ABS_MT_TOUCH_MAJOR, 0);
+			input_report_abs(ts->touch_input, ABS_PRESSURE, 0);
+			input_report_key(ts->touch_input, BTN_TOUCH, 0);
 			input_mt_sync(ts->touch_input);
 #endif
 			input_sync(ts->touch_input);
@@ -364,9 +370,11 @@ static int innolux_ts_probe(struct i2c_client *client, const struct i2c_device_i
     input_set_abs_params(touch_input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
     input_set_abs_params(touch_input, ABS_MT_POSITION_X, t_min_x, t_max_x, 0, 0);
     input_set_abs_params(touch_input, ABS_MT_POSITION_Y, t_min_y, t_max_y, 0, 0);
+    input_set_abs_params(touch_input, ABS_PRESSURE, 0, 255, 0, 0);
 #endif
 	
-    keyevent_input->name  = "innolux_ts_key";
+    //I just rename the touchscreen name to make different with original
+    keyevent_input->name  = "innolux_ts_key-ics";
     keyevent_input->phys  = "innolux_ts/input1";
     set_bit(EV_KEY, keyevent_input->evbit);
     set_bit(KEY_MENU, keyevent_input->keybit);
